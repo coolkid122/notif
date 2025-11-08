@@ -4,6 +4,7 @@ import aiohttp
 import os
 import logging
 import time
+from collections import deque
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ if not TOKEN or not WEBHOOK_URL:
 CHANNEL_ID = "1434326527075553452"
 last_id = None
 session = None
+request_times = deque(maxlen=10)  # Track last 10 request timestamps
 
 async def init_session():
     global session
@@ -26,16 +28,29 @@ async def init_session():
     }
     session = aiohttp.ClientSession(headers=headers)
 
-async def safe_get(url):
+async def rate_limited_get(url):
+    global request_times
     while True:
+        now = time.time()
+        # Remove old timestamps
+        while request_times and request_times[0] < now - 1.0:
+            request_times.popleft()
+        # Check limit
+        if len(request_times) >= 10:
+            wait = 1.0 - (now - request_times[0])
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+        # Make request
         try:
             async with session.get(url) as r:
+                request_times.append(time.time())
                 if r.status == 200:
                     return await r.json()
                 elif r.status == 429:
                     data = await r.json()
                     retry = data.get("retry_after", 1) + 0.1
-                    logger.warning(f"Rate limited. Wait {retry:.2f}s")
+                    logger.warning(f"Rate limited by Discord. Wait {retry:.2f}s")
                     await asyncio.sleep(retry)
                 else:
                     text = await r.text()
@@ -70,15 +85,14 @@ async def monitor():
     await init_session()
 
     # Initial fetch
-    data = await safe_get(f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?limit=1")
-    if data and data[0]["id"] != last_id:
+    data = await rate_limited_get(f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?limit=1")
+    if data:
         last_id = data[0]["id"]
         logger.info(f"Monitoring channel after message ID: {last_id}")
 
-    # Fast polling: 1 request every 1.1 seconds (safe max)
+    # 10 requests per second MAX
     while True:
-        start = time.time()
-        data = await safe_get(f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?after={last_id}&limit=50")
+        data = await rate_limited_get(f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?after={last_id}&limit=50")
         if data:
             for m in data:
                 payload = {
@@ -91,10 +105,10 @@ async def monitor():
                 await safe_post(payload)
                 last_id = m["id"]
             if data:
-                logger.info(f"Forwarded {len(data)} message(s) in {time.time()-start:.2f}s")
+                logger.info(f"Forwarded {len(data)} message(s)")
 
-        # Max safe: ~1 request per 1.1 seconds
-        await asyncio.sleep(1.1)
+        # Sleep to maintain ~10 req/s
+        await asyncio.sleep(0.1)
 
 if __name__ == "__main__":
     asyncio.run(monitor())
