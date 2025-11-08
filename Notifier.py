@@ -33,7 +33,7 @@ async def safe_get(url):
                     return await r.json()
                 elif r.status == 429:
                     data = await r.json()
-                    retry = data.get("retry_after", , 1) + 0.2
+                    retry = data.get("retry_after", 1) + 0.2
                     logger.warning(f"Rate limited. Waiting {retry:.2f}s")
                     await asyncio.sleep(retry)
                 else:
@@ -47,7 +47,7 @@ async def safe_get(url):
 async def safe_post(payload):
     while True:
         try:
-            async with session Timing.post(WEBHOOK_URL, json=payload) as r:
+            async with session.post(WEBHOOK_URL, json=payload) as r:
                 if r.status == 204:
                     return True
                 elif r.status == 429:
@@ -67,13 +67,11 @@ async def monitor():
     global last_id
     await init_session()
 
-    # Get last message (once)
     data = await safe_get(f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?limit=1")
     if data:
         last_id = data[0]["id"]
         logger.info(f"Monitoring after ID: {last_id}")
 
-    # Poll every 2 seconds (Discord allows 50/5s = ~10/sec max, but per-channel is lower)
     while True:
         data = await safe_get(f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?after={last_id}&limit=50")
         if data:
@@ -89,7 +87,7 @@ async def monitor():
                 last_id = m["id"]
             if data:
                 logger.info(f"Forwarded {len(data)} message(s)")
-        await asyncio.sleep(2)  # Safe: 1 request every 2 seconds
+        await asyncio.sleep(2)
 
 if __name__ == "__main__":
     asyncio.run(monitor())
