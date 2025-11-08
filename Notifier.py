@@ -13,10 +13,19 @@ WEBHOOK_URL = os.getenv("WEBHOOK")
 if not TOKEN or not WEBHOOK_URL:
     raise RuntimeError("TOKEN and WEBHOOK required")
 
-last_id = None
 CHANNEL_ID = "1434326527075553452"
+last_id = None
+session = None
 
-async def make_get_request(session, url):
+async def init_session():
+    global session
+    headers = {
+        "Authorization": f"Bot {TOKEN}",
+        "User-Agent": "DiscordBot (https://github.com/you, 1.0)"
+    }
+    session = aiohttp.ClientSession(headers=headers)
+
+async def safe_get(url):
     while True:
         try:
             async with session.get(url) as r:
@@ -24,65 +33,63 @@ async def make_get_request(session, url):
                     return await r.json()
                 elif r.status == 429:
                     data = await r.json()
-                    retry = data.get("retry_after", 1) + 0.1
-                    logger.warning(f"Rate limited on {url}. Sleep {retry:.2f}s")
+                    retry = data.get("retry_after", , 1) + 0.2
+                    logger.warning(f"Rate limited. Waiting {retry:.2f}s")
                     await asyncio.sleep(retry)
                 else:
                     text = await r.text()
-                    logger.error(f"Request failed: {r.status} {text}")
-                    await asyncio.sleep(1)
+                    logger.error(f"GET failed {r.status}: {text}")
+                    await asyncio.sleep(2)
         except Exception as e:
-            logger.error(f"Request exception: {e}")
-            await asyncio.sleep(1)
+            logger.error(f"GET error: {e}")
+            await asyncio.sleep(2)
+
+async def safe_post(payload):
+    while True:
+        try:
+            async with session Timing.post(WEBHOOK_URL, json=payload) as r:
+                if r.status == 204:
+                    return True
+                elif r.status == 429:
+                    data = await r.json()
+                    retry = data.get("retry_after", 1) + 0.2
+                    logger.warning(f"Webhook rate limit. Wait {retry:.2f}s")
+                    await asyncio.sleep(retry)
+                else:
+                    text = await r.text()
+                    logger.warning(f"Webhook error {r.status}: {text}")
+                    return False
+        except Exception as e:
+            logger.error(f"POST error: {e}")
+            await asyncio.sleep(2)
 
 async def monitor():
     global last_id
-    headers = {
-        "Authorization": f"Bot {TOKEN}",
-        "User-Agent": "DiscordBot (https://github.com/you, 1.0)"
-    }
-    async with aiohttp.ClientSession(headers=headers) as s:
-        # Get last message with retry
-        data = await make_get_request(s, f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?limit=1")
-        if data:
-            last_id = data[0]["id"]
-            logger.info(f"Started. Last ID: {last_id}")
+    await init_session()
 
-        while True:
-            data = await make_get_request(s, f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?after={last_id}&limit=50")
-            if data:
-                for m in data:
-                    await forward(m, s)
-                    last_id = m["id"]
-                if data:
-                    logger.info(f"Forwarded {len(data)} messages")
-            await asyncio.sleep(0.1)  # 10 req/s
+    # Get last message (once)
+    data = await safe_get(f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?limit=1")
+    if data:
+        last_id = data[0]["id"]
+        logger.info(f"Monitoring after ID: {last_id}")
 
-async def forward(msg, s):
-    payload = {
-        "content": msg.get("content") or None,
-        "username": msg["author"]["username"],
-        "avatar_url": msg["author"].get("avatar") and f"https://cdn.discordapp.com/avatars/{msg['author']['id']}/{msg['author']['avatar']}.png",
-        "embeds": msg.get("embeds", []),
-        "attachments": [{"url": a["url"]} for a in msg.get("attachments", [])] if msg.get("attachments") else []
-    }
+    # Poll every 2 seconds (Discord allows 50/5s = ~10/sec max, but per-channel is lower)
     while True:
-        try:
-            async with s.post(WEBHOOK_URL, json=payload) as r:
-                if r.status == 204:
-                    return
-                elif r.status == 429:
-                    data = await r.json()
-                    retry = data.get("retry_after", 1) + 0.1
-                    logger.warning(f"Webhook rate limited. Sleep {retry:.2f}s")
-                    await asyncio.sleep(retry)
-                else:
-                    text = await r.text()
-                    logger.warning(f"Webhook failed: {r.status} {text}")
-                    return  # Don't retry on other errors
-        except Exception as e:
-            logger.error(f"Send error: {e}")
-            await asyncio.sleep(1)
+        data = await safe_get(f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?after={last_id}&limit=50")
+        if data:
+            for m in data:
+                payload = {
+                    "content": m.get("content") or None,
+                    "username": m["author"]["username"],
+                    "avatar_url": m["author"].get("avatar") and f"https://cdn.discordapp.com/avatars/{m['author']['id']}/{m['author']['avatar']}.png",
+                    "embeds": m.get("embeds", []),
+                    "attachments": [{"url": a["url"]} for a in m.get("attachments", [])]
+                }
+                await safe_post(payload)
+                last_id = m["id"]
+            if data:
+                logger.info(f"Forwarded {len(data)} message(s)")
+        await asyncio.sleep(2)  # Safe: 1 request every 2 seconds
 
 if __name__ == "__main__":
     asyncio.run(monitor())
