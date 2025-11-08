@@ -3,7 +3,6 @@ import asyncio
 import aiohttp
 import os
 import logging
-import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,60 +16,47 @@ if not TOKEN or not WEBHOOK_URL:
 last_id = None
 CHANNEL_ID = "1434326527075553452"
 
+async def make_get_request(session, url):
+    while True:
+        try:
+            async with session.get(url) as r:
+                if r.status == 200:
+                    return await r.json()
+                elif r.status == 429:
+                    data = await r.json()
+                    retry = data.get("retry_after", 1) + 0.1
+                    logger.warning(f"Rate limited on {url}. Sleep {retry:.2f}s")
+                    await asyncio.sleep(retry)
+                else:
+                    text = await r.text()
+                    logger.error(f"Request failed: {r.status} {text}")
+                    await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Request exception: {e}")
+            await asyncio.sleep(1)
+
 async def monitor():
     global last_id
     headers = {
         "Authorization": f"Bot {TOKEN}",
         "User-Agent": "DiscordBot (https://github.com/you, 1.0)"
     }
-    connector = aiohttp.TCPConnector(limit=10)
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(headers=headers, connector=connector, timeout=timeout) as s:
-        # Get last message
-        async with s.get(f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?limit=1") as r:
-            if r.status == 429:
-                data = await r.json()
-                retry = data.get("retry_after", 1)
-                logger.warning(f"Rate limited. Waiting {retry}s")
-                await asyncio.sleep(retry)
-            elif r.status != 200:
-                text = await r.text()
-                logger.error(f"Init failed: {r.status} {text}")
-                return
-            else:
-                data = await r.json()
-                if data:
-                    last_id = data[0]["id"]
-                    logger.info(f"Started. Last ID: {last_id}")
+    async with aiohttp.ClientSession(headers=headers) as s:
+        # Get last message with retry
+        data = await make_get_request(s, f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?limit=1")
+        if data:
+            last_id = data[0]["id"]
+            logger.info(f"Started. Last ID: {last_id}")
 
-        # Fast polling with smart backoff
         while True:
-            try:
-                start = time.time()
-                async with s.get(f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?after={last_id}&limit=50") as r:
-                    if r.status == 200:
-                        msgs = await r.json()
-                        for m in msgs:
-                            await forward(m, s)
-                            last_id = m["id"]
-                        if msgs:
-                            logger.info(f"Forwarded {len(msgs)} new messages")
-                    elif r.status == 429:
-                        data = await r.json()
-                        retry = data.get("retry_after", 1) + 0.1
-                        logger.warning(f"Rate limited. Sleep {retry:.2f}s")
-                        await asyncio.sleep(retry)
-                        continue
-                    else:
-                        logger.warning(f"Poll error: {r.status}")
-                
-                # Aim for ~10 requests/sec
-                elapsed = time.time() - start
-                wait = max(0.006, 0.1 - elapsed)
-                await asyncio.sleep(wait)
-            except Exception as e:
-                logger.error(f"Exception: {e}")
-                await asyncio.sleep(1)
+            data = await make_get_request(s, f"https://discord.com/api/v9/channels/{CHANNEL_ID}/messages?after={last_id}&limit=50")
+            if data:
+                for m in data:
+                    await forward(m, s)
+                    last_id = m["id"]
+                if data:
+                    logger.info(f"Forwarded {len(data)} messages")
+            await asyncio.sleep(0.1)  # 10 req/s
 
 async def forward(msg, s):
     payload = {
@@ -80,13 +66,23 @@ async def forward(msg, s):
         "embeds": msg.get("embeds", []),
         "attachments": [{"url": a["url"]} for a in msg.get("attachments", [])] if msg.get("attachments") else []
     }
-    try:
-        async with s.post(WEBHOOK_URL, json=payload) as r:
-            if r.status != 204:
-                text = await r.text()
-                logger.warning(f"Webhook failed: {r.status} {text}")
-    except Exception as e:
-        logger.error(f"Send error: {e}")
+    while True:
+        try:
+            async with s.post(WEBHOOK_URL, json=payload) as r:
+                if r.status == 204:
+                    return
+                elif r.status == 429:
+                    data = await r.json()
+                    retry = data.get("retry_after", 1) + 0.1
+                    logger.warning(f"Webhook rate limited. Sleep {retry:.2f}s")
+                    await asyncio.sleep(retry)
+                else:
+                    text = await r.text()
+                    logger.warning(f"Webhook failed: {r.status} {text}")
+                    return  # Don't retry on other errors
+        except Exception as e:
+            logger.error(f"Send error: {e}")
+            await asyncio.sleep(1)
 
 if __name__ == "__main__":
     asyncio.run(monitor())
